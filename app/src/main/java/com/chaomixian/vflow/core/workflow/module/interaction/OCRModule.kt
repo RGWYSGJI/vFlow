@@ -14,6 +14,8 @@ import com.chaomixian.vflow.core.module.*
 import com.chaomixian.vflow.ocr.PpOcrV5ModelManager
 import com.chaomixian.vflow.ocr.PpOcrV5Native
 import com.chaomixian.vflow.ocr.PpOcrV5NativeItem
+import com.chaomixian.vflow.ocr.OcrTextBox
+import com.chaomixian.vflow.ocr.OcrTextComposer
 import com.chaomixian.vflow.core.types.VTypeRegistry
 import com.chaomixian.vflow.core.types.basic.VBoolean
 import com.chaomixian.vflow.core.types.basic.VNull
@@ -84,7 +86,8 @@ class OCRModule : BaseModule() {
             id = "engine",
             name = "识别引擎",
             staticType = ParameterType.ENUM,
-            defaultValue = ENGINE_ML_KIT,
+            // 默认改用本地 PP-OCRv5：检测分辨率与阈值已按 GestureEVO 调优，中文小字明显更准。
+            defaultValue = ENGINE_PP_OCR_V5,
             options = listOf(ENGINE_ML_KIT, ENGINE_PP_OCR_V5),
             acceptsMagicVariable = false,
             inputStyle = InputStyle.CHIP_GROUP,
@@ -254,7 +257,7 @@ class OCRModule : BaseModule() {
         val inputsById = getInputs().associateBy { it.id }
         val rawMode = context.getVariableAsString("mode", MODE_RECOGNIZE)
         val mode = inputsById["mode"]?.normalizeEnumValue(rawMode) ?: rawMode
-        val rawEngine = context.getVariableAsString("engine", ENGINE_ML_KIT)
+        val rawEngine = context.getVariableAsString("engine", ENGINE_PP_OCR_V5)
         val engine = inputsById["engine"]?.normalizeEnumValue(rawEngine) ?: rawEngine
         val rawLanguage = context.getVariableAsString("language", LANGUAGE_MIXED)
         val language = inputsById["language"]?.normalizeEnumValue(rawLanguage) ?: rawLanguage
@@ -318,11 +321,21 @@ class OCRModule : BaseModule() {
                 }
 
                 if (mode == MODE_RECOGNIZE) {
-                    val textList = adjustedItems
-                        .sortedWith(compareBy<Pair<String, VCoordinateRegion>>({ it.second.top }, { it.second.left }))
-                        .map { it.first.trim() }
-                        .filter { it.isNotEmpty() }
-                    val fullText = textList.joinToString("\n")
+                    // 先把逐框结果按几何位置聚成视觉行、再拼成段落：
+                    // 同一行被拆成多个框时不再强行换行，英文跨框补空格，软换行接回同一段。
+                    val layout = OcrTextComposer.compose(
+                        adjustedItems.map { (text, region) ->
+                            OcrTextBox(
+                                text = text,
+                                left = region.left,
+                                top = region.top,
+                                right = region.right,
+                                bottom = region.bottom,
+                            )
+                        }
+                    )
+                    val textList = layout.lines
+                    val fullText = layout.fullText
                     val structuredJson = buildStructuredJsonFromNativeItems(nativeResult.items, topLeft)
                     onProgress(ProgressUpdate("识别完成，文字长度: ${fullText.length}"))
                     return ExecutionResult.Success(mapOf(
