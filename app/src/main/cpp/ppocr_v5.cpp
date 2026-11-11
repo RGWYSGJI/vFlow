@@ -66,7 +66,8 @@ static cv::Mat get_rotate_crop_image(const cv::Mat& rgb, const OcrObject& object
     return dst;
 }
 
-PPOcrV5::PPOcrV5() : targetSize_(640) {}
+// 与 GestureEVO 对齐：检测画布按长边 1728 缩放（原来 640，小字在检测前就糊了）。
+PPOcrV5::PPOcrV5() : targetSize_(1728) {}
 
 PPOcrV5::~PPOcrV5() = default;
 
@@ -76,15 +77,17 @@ int PPOcrV5::load(const char* detParamPath, const char* detModelPath, const char
     recNet_.clear();
 
     detNet_.opt.use_vulkan_compute = false;
+    detNet_.opt.num_threads = ncnn::get_big_cpu_count();
     detNet_.opt.use_fp16_packed = useFp16;
     detNet_.opt.use_fp16_storage = useFp16;
-    detNet_.opt.use_fp16_arithmetic = useFp16;
+    // CPU 上关闭 fp16 算术：累加精度不足会拉低识别率（GestureEVO 全程 FP32 计算）。
+    detNet_.opt.use_fp16_arithmetic = false;
 
-    recNet_.opt.num_threads = 1;
     recNet_.opt.use_vulkan_compute = false;
+    recNet_.opt.num_threads = ncnn::get_big_cpu_count();
     recNet_.opt.use_fp16_packed = useFp16;
     recNet_.opt.use_fp16_storage = useFp16;
-    recNet_.opt.use_fp16_arithmetic = useFp16;
+    recNet_.opt.use_fp16_arithmetic = false;
 
     if (detNet_.load_param(detParamPath) != 0) return -1;
     if (detNet_.load_model(detModelPath) != 0) return -2;
@@ -157,9 +160,11 @@ int PPOcrV5::detect(const cv::Mat& rgb, std::vector<OcrObject>& objects)
     out.to_pixels(pred.data, ncnn::Mat::PIXEL_GRAY);
 
     cv::Mat bitmap;
-    cv::threshold(pred, bitmap, 0.3f * 255, 255, cv::THRESH_BINARY);
+    // 与 GestureEVO 的 kBinaryThreshold=0.1 对齐；0.3 会漏掉低对比度/浅色文字。
+    cv::threshold(pred, bitmap, 0.1f * 255, 255, cv::THRESH_BINARY);
 
-    const float boxThresh = 0.6f;
+    // 与 GestureEVO 的 kBoxThreshold=0.3 对齐；0.6 会丢弃大量真实文本框。
+    const float boxThresh = 0.3f;
     const float enlargeRatio = 1.95f;
     const float minSize = 3 * scale;
     const int maxCandidates = 1000;
