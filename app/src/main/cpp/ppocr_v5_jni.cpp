@@ -4,6 +4,8 @@
 #include <android/log.h>
 #include <jni.h>
 
+#include <algorithm>
+#include <cmath>
 #include <fstream>
 #include <mutex>
 #include <sstream>
@@ -113,8 +115,14 @@ std::string run_ocr_json(JNIEnv* env, jobject bitmap)
         return "{\"success\":false,\"error\":\"bitmap_decode_failed\"}";
     }
 
+    // 与 GestureEVO 一致：四周补白边，避免贴边文字在检测阶段被裁掉。
+    const int border = std::max(8, static_cast<int>(std::lround(std::max(rgb.cols, rgb.rows) * 0.01)));
+    cv::Mat padded;
+    cv::copyMakeBorder(rgb, padded, border, border, border, border,
+                       cv::BORDER_CONSTANT, cv::Scalar(255, 255, 255));
+
     std::vector<OcrObject> objects;
-    int result = gEngine->detectAndRecognize(rgb, objects);
+    int result = gEngine->detectAndRecognize(padded, objects);
     if (result != 0)
     {
         return "{\"success\":false,\"error\":\"ocr_inference_failed\"}";
@@ -128,6 +136,7 @@ std::string run_ocr_json(JNIEnv* env, jobject bitmap)
         const OcrObject& object = objects[i];
         cv::Point2f corners[4];
         object.rrect.points(corners);
+        const float offset = static_cast<float>(border);
         std::string text = gEngine->decodeText(object);
 
         if (i > 0) json << ",";
@@ -135,8 +144,8 @@ std::string run_ocr_json(JNIEnv* env, jobject bitmap)
         json << "\"text\":\"" << json_escape(text) << "\",";
         json << "\"score\":" << object.prob << ",";
         json << "\"orientation\":" << object.orientation << ",";
-        json << "\"centerX\":" << object.rrect.center.x << ",";
-        json << "\"centerY\":" << object.rrect.center.y << ",";
+        json << "\"centerX\":" << (object.rrect.center.x - offset) << ",";
+        json << "\"centerY\":" << (object.rrect.center.y - offset) << ",";
         json << "\"width\":" << object.rrect.size.width << ",";
         json << "\"height\":" << object.rrect.size.height << ",";
         json << "\"angle\":" << object.rrect.angle << ",";
@@ -144,7 +153,7 @@ std::string run_ocr_json(JNIEnv* env, jobject bitmap)
         for (int p = 0; p < 4; p++)
         {
             if (p > 0) json << ",";
-            json << "{\"x\":" << corners[p].x << ",\"y\":" << corners[p].y << "}";
+            json << "{\"x\":" << (corners[p].x - offset) << ",\"y\":" << (corners[p].y - offset) << "}";
         }
         json << "]";
         json << "}";
@@ -175,7 +184,8 @@ Java_com_chaomixian_vflow_ocr_PpOcrV5Native_nativeLoadModel(
 
     delete gEngine;
     gEngine = new PPOcrV5();
-    gEngine->setTargetSize(640);
+    // 与 GestureEVO 对齐：检测长边 1728（原 640 时 1080p 截图会被缩到 ~288×640）。
+    gEngine->setTargetSize(1728);
     gEngine->setDictionary(load_dictionary(dictPath));
 
     int loadResult = gEngine->load(
