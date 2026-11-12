@@ -208,7 +208,10 @@ data class RuleExecutionState(
      * 重置状态
      */
     fun reset() {
-        matchChangedTime = 0L
+        // GKD 语义：matchTime 从“重置时刻”开始计时。
+        // 以前这里写成 0，导致 t - 0 > matchTime 立即成立，
+        // 所有带 matchTime 的规则第一帧就被判定 Expired，永远不会触发。
+        matchChangedTime = System.currentTimeMillis()
         actionTriggerTime = 0L
         actionCount = 0
         actionDelayTriggerTime = 0L
