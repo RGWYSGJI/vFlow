@@ -11,7 +11,8 @@ data class GKDTriggerState(
     val trigger: TriggerSpec,
     val rules: List<ResolvedGKDRule>,
     // 每个规则的执行状态
-    val ruleStates: MutableMap<ResolvedGKDRule, RuleExecutionState> = mutableMapOf()
+    // 用 IdentityHashMap：同名规则（name+group 相同）也各自有独立状态，避免串台
+    val ruleStates: MutableMap<ResolvedGKDRule, RuleExecutionState> = java.util.IdentityHashMap()
 ) {
     // 已匹配的规则 key 集合（用于 preKeys 检查）
     val matchedKeys: MutableSet<Int> = mutableSetOf()
@@ -96,8 +97,11 @@ data class RuleExecutionState(
     /**
      * 获取当前触发状态
      */
-    fun getStatus(): TriggerStatus {
+    fun getStatus(sharedTriggerTime: Long? = null, sharedActionCount: Int? = null): TriggerStatus {
         val t = System.currentTimeMillis()
+        // actionCdKey / actionMaximumKey：与关联规则共享冷却和次数（GKD 的 shareCooldown/shareCount）
+        val effectiveTriggerTime = maxOf(actionTriggerTime, sharedTriggerTime ?: 0L)
+        val effectiveCount = maxOf(actionCount, sharedActionCount ?: 0)
 
         // 获取参数值到局部变量，避免 smart cast 问题
         val actionCdVal = actionCd
@@ -116,12 +120,12 @@ data class RuleExecutionState(
         }
 
         // 1. 检查最大触发次数
-        if (actionMaximumVal != null && actionCount >= actionMaximumVal) {
+        if (actionMaximumVal != null && effectiveCount >= actionMaximumVal) {
             return TriggerStatus.MaxReached
         }
 
         // 2. 检查冷却时间 (actionCd)
-        if (t - actionTriggerTime < actionCdVal) {
+        if (t - effectiveTriggerTime < actionCdVal) {
             return TriggerStatus.Cooling
         }
 
@@ -153,8 +157,19 @@ data class RuleExecutionState(
     /**
      * 检查是否应该触发
      */
-    fun shouldTrigger(): Boolean {
-        return getStatus() == TriggerStatus.Ready
+    fun shouldTrigger(sharedTriggerTime: Long? = null, sharedActionCount: Int? = null): Boolean {
+        return getStatus(sharedTriggerTime, sharedActionCount) == TriggerStatus.Ready
+    }
+
+    /**
+     * 是否是 priority 规则（priorityTime 窗口内、且未超过 priorityActionMaximum）。
+     */
+    fun isPriority(): Boolean {
+        val priorityTimeVal = priorityTime ?: return false
+        if (priorityTimeVal <= 0) return false
+        val maxActions = priorityActionMaximum
+        if (maxActions != null && actionCount >= maxActions) return false
+        return System.currentTimeMillis() - matchChangedTime < priorityTimeVal + matchDelay
     }
 
     /**
@@ -229,7 +244,8 @@ data class ResolvedGKDRule(
     val actionMaximumKey: Int?,
     val forcedTime: Long?,
     val priorityTime: Long?,
-    val priorityActionMaximum: Int?
+    val priorityActionMaximum: Int?,
+    val order: Int = 0
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
