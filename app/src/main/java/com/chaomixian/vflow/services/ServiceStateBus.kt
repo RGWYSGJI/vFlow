@@ -36,7 +36,10 @@ object ServiceStateBus {
         val event: AccessibilityEvent?,
     )
 
-    private val gkdEventRef = java.util.concurrent.atomic.AtomicReference<GkdWindowEvent?>(null)
+    // 小队列而不是“只留最新一条”：避免开屏这种极短状态被合并掉
+    private const val GKD_EVENT_QUEUE_LIMIT = 8
+    private val gkdEventQueue = ArrayDeque<GkdWindowEvent>()
+    private val gkdEventLock = Any()
 
     private val _gkdEventSignal = MutableSharedFlow<Unit>(
         extraBufferCapacity = 1,
@@ -55,15 +58,33 @@ object ServiceStateBus {
         } catch (_: Exception) {
             null
         }
-        val old = gkdEventRef.getAndSet(GkdWindowEvent(packageName, className, copy))
-        old?.event?.recycle()
+        val dropped = synchronized(gkdEventLock) {
+            val overflow = if (gkdEventQueue.size >= GKD_EVENT_QUEUE_LIMIT) gkdEventQueue.removeFirst() else null
+            gkdEventQueue.addLast(GkdWindowEvent(packageName, className, copy))
+            overflow
+        }
+        dropped?.event?.recycle()
         _gkdEventSignal.tryEmit(Unit)
     }
 
     /**
-     * 取出最新的 GKD 事件；调用方用完必须 recycle 其中的 event。
+     * 取出当前队列里的 GKD 事件；调用方用完必须 recycle 其中的 event。
      */
-    fun takeGkdWindowEvent(): GkdWindowEvent? = gkdEventRef.getAndSet(null)
+    fun takeGkdWindowEvents(): List<GkdWindowEvent> = synchronized(gkdEventLock) {
+        if (gkdEventQueue.isEmpty()) return emptyList()
+        val list = gkdEventQueue.toList()
+        gkdEventQueue.clear()
+        list
+    }
+
+    // 每个包最近一次窗口状态事件里的类名（Activity），避免 content-changed 的 View 类名把 Activity 顶掉
+    private val activityClassByPackage = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    fun rememberActivityClass(packageName: String, className: String) {
+        activityClassByPackage[packageName] = className
+    }
+
+    fun activityClassFor(packageName: String): String? = activityClassByPackage[packageName]
 
     // 缓存最后一个窗口类名，供 UIInspector 使用
     var lastWindowClassName: String? = null
@@ -102,6 +123,7 @@ object ServiceStateBus {
         accessibilityServiceRef?.clear()
         accessibilityServiceRef = null
         lastWindowClassName = null
+        activityClassByPackage.clear()
         lastWindowPackageName = null
         lastActivityClassName = null
         lastActivityPackageName = null
@@ -138,6 +160,7 @@ object ServiceStateBus {
             lastActivityClassName = confirmedActivityClassName
             lastActivityPackageName = packageName
         }
+        rememberActivityClass(packageName, confirmedActivityClassName ?: className)
         _windowChangeEventFlow.emit(packageName to className)
     }
 
