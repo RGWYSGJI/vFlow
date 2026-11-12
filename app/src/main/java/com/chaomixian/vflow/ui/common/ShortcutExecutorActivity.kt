@@ -26,12 +26,9 @@ class ShortcutExecutorActivity : AppCompatActivity() {
                 val workflow = workflowManager.getWorkflow(workflowId)
 
                 if (workflow != null) {
-                    // 显示提示并执行工作流
-                    Toast.makeText(
-                        applicationContext,
-                        getString(com.chaomixian.vflow.R.string.shortcut_executing, workflow.name),
-                        Toast.LENGTH_SHORT
-                    ).show()
+                    // 不再弹“正在通过快捷方式启动: xxx”的 Toast：
+                    // 外部（adb / 快捷方式 / 小组件 / 磁贴）调用时都会走到这里，
+                    // 这个提示只会造成打扰。工作流内部的 Toast 模块不受影响。
                     WorkflowExecutor.execute(
                         workflow = workflow,
                         context = applicationContext,
