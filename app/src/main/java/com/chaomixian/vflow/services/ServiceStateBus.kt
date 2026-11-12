@@ -3,9 +3,11 @@ package com.chaomixian.vflow.services
 
 import android.content.Context
 import android.content.Intent
+import android.view.accessibility.AccessibilityEvent
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import com.chaomixian.vflow.core.logging.DebugLogger
 import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.asSharedFlow
 import java.lang.ref.WeakReference
 
@@ -24,6 +26,44 @@ object ServiceStateBus {
     // 创建一个 SharedFlow 用于广播窗口内容变化事件 (包名, 类名)
     private val _windowContentChangedFlow = MutableSharedFlow<Pair<String, String>>()
     val windowContentChangedFlow = _windowContentChangedFlow.asSharedFlow()
+
+    // ---- GKD 触发器专用事件通道 ----
+    // 同一时刻只保留最新一条事件（含事件副本），避免 content-changed 高频事件把匹配队列撑爆；
+    // 上面的 Pair 事件流保持原样，供其他触发器继续使用。
+    class GkdWindowEvent(
+        val packageName: String,
+        val className: String,
+        val event: AccessibilityEvent?,
+    )
+
+    private val gkdEventRef = java.util.concurrent.atomic.AtomicReference<GkdWindowEvent?>(null)
+
+    private val _gkdEventSignal = MutableSharedFlow<Unit>(
+        extraBufferCapacity = 1,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST,
+    )
+    val gkdEventSignal = _gkdEventSignal.asSharedFlow()
+
+    /**
+     * 由无障碍服务调用：投递一条 GKD 事件（内部复制 event，调用方无需关心生命周期）。
+     */
+    fun postGkdWindowEvent(packageName: String, className: String, event: AccessibilityEvent?) {
+        // 没有 GKD 触发器在监听时不复制事件，避免给普通场景增加开销
+        if (_gkdEventSignal.subscriptionCount.value == 0) return
+        val copy = try {
+            event?.let { AccessibilityEvent.obtain(it) }
+        } catch (_: Exception) {
+            null
+        }
+        val old = gkdEventRef.getAndSet(GkdWindowEvent(packageName, className, copy))
+        old?.event?.recycle()
+        _gkdEventSignal.tryEmit(Unit)
+    }
+
+    /**
+     * 取出最新的 GKD 事件；调用方用完必须 recycle 其中的 event。
+     */
+    fun takeGkdWindowEvent(): GkdWindowEvent? = gkdEventRef.getAndSet(null)
 
     // 缓存最后一个窗口类名，供 UIInspector 使用
     var lastWindowClassName: String? = null
