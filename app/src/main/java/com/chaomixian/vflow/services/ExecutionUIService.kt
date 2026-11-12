@@ -195,6 +195,21 @@ class ExecutionUIService(private val context: Context) {
         return startActivityAndAwaitResult(intent, title, "点击这里输入 $type").await()
     }
 
+    /**
+     * 请求用户从一组文本中选择一项。
+     *
+     * @return 所选项目的 0 基下标；取消、超时或界面被回收时返回 null。
+     */
+    suspend fun requestMenuChoice(title: String, items: List<String>): Int? {
+        if (items.isEmpty()) return null
+        val intent = Intent(context, OverlayUIActivity::class.java).apply {
+            putExtra("request_type", "menu_choice")
+            putExtra("title", title)
+            putStringArrayListExtra("menu_items", ArrayList(items))
+        }
+        return startActivityAndAwaitResult(intent, title, "点击这里选择").await() as? Int
+    }
+
     suspend fun requestSpeechToText(
         request: SpeechToTextOverlayRequest
     ): SpeechToTextResult? {
