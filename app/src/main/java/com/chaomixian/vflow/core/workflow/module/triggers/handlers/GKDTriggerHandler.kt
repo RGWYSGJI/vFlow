@@ -679,21 +679,26 @@ class GKDTriggerHandler : ListeningTriggerHandler() {
                     state.currentActivity = currentActivity
                 }
 
-                // 匹配规则：priority 规则优先，其余按 order 排序（对齐 GKD）
-                // 先算好 priority 再排序，避免比较器里读时钟导致排序契约不一致
-                val orderedRules = state.rules
-                    .map { rule -> rule to if (state.getRuleState(rule).isPriority()) 0 else 1 }
-                    .sortedWith(compareBy<Pair<ResolvedGKDRule, Int>>({ it.second }, { it.first.order }))
-                    .map { it.first }
+                // 只遍历“当前 App 的规则 + 全局规则”（加载时已按 order 排序）。
+                // 只有存在 priority 规则时才做一次小排序，避免每个事件排序全量规则。
+                val candidates = state.candidateRules(currentPackage)
+                val orderedRules = if (candidates.any { state.getRuleState(it).isPriority() }) {
+                    candidates
+                        .map { rule -> rule to if (state.getRuleState(rule).isPriority()) 0 else 1 }
+                        .sortedWith(compareBy<Pair<ResolvedGKDRule, Int>>({ it.second }, { it.first.order }))
+                        .map { it.first }
+                } else {
+                    candidates
+                }
                 for (rule in orderedRules) {
                     val ruleState = state.getRuleState(rule)
 
                     // 检查规则状态（actionCdKey / actionMaximumKey 共享）
                     val sharedCooldown = rule.actionCdKey?.let { key ->
-                        state.rules.firstOrNull { it.key == key }?.let { state.getRuleState(it).actionTriggerTime }
+                        state.rulesByKey[key]?.let { state.getRuleState(it).actionTriggerTime }
                     }
                     val sharedCount = rule.actionMaximumKey?.let { key ->
-                        state.rules.firstOrNull { it.key == key }?.let { state.getRuleState(it).actionCount }
+                        state.rulesByKey[key]?.let { state.getRuleState(it).actionCount }
                     }
                     if (!ruleState.shouldTrigger(sharedCooldown, sharedCount)) {
                         if (rule.appId == null || rule.appId == currentPackage) {
