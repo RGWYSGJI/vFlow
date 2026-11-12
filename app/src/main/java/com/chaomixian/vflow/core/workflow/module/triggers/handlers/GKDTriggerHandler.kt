@@ -50,10 +50,16 @@ class GKDTriggerHandler : ListeningTriggerHandler() {
     companion object {
         private const val TAG = "GKDTriggerHandler"
         private const val RULES_DIR = "gkd_rules"
+
+        /** 规则加载失败后，多久再重试（避免每个窗口事件都重新下载/解析）。 */
+        private const val LOAD_RETRY_INTERVAL_MS = 5 * 60 * 1000L
     }
 
     // 存储所有工作流的状态
     private val triggerStates = CopyOnWriteArrayList<GKDTriggerState>()
+
+    // 规则加载失败的工作流 -> 失败时间，避免高频重试
+    private val failedTriggerStates = java.util.concurrent.ConcurrentHashMap<String, Long>()
 
     // Transform 实例
     private val transform = createTransform()
@@ -70,17 +76,19 @@ class GKDTriggerHandler : ListeningTriggerHandler() {
             // 只保留最新一条事件（ServiceStateBus 内部 conflate），串行匹配，
             // 避免 content-changed 高频事件把匹配队列撑爆。
             ServiceStateBus.gkdEventSignal.collect {
-                val windowEvent = ServiceStateBus.takeGkdWindowEvent() ?: return@collect
-                try {
-                    DebugLogger.d(TAG, "收到窗口事件: ${windowEvent.packageName} / ${windowEvent.className}")
-                    checkAndTriggerWorkflows(
-                        context = context,
-                        packageName = windowEvent.packageName,
-                        className = windowEvent.className,
-                        event = windowEvent.event,
-                    )
-                } finally {
-                    windowEvent.event?.recycle()
+                val events = ServiceStateBus.takeGkdWindowEvents()
+                for (windowEvent in events) {
+                    try {
+                        DebugLogger.d(TAG, "收到窗口事件: ${windowEvent.packageName} / ${windowEvent.className}")
+                        checkAndTriggerWorkflows(
+                            context = context,
+                            packageName = windowEvent.packageName,
+                            className = windowEvent.className,
+                            event = windowEvent.event,
+                        )
+                    } finally {
+                        windowEvent.event?.recycle()
+                    }
                 }
             }
         }
@@ -102,13 +110,23 @@ class GKDTriggerHandler : ListeningTriggerHandler() {
         triggerStates.removeAll { state ->
             !currentTriggerIds.contains(state.trigger.triggerId)
         }
+        failedTriggerStates.keys.retainAll(currentTriggerIds)
 
+        val now = System.currentTimeMillis()
         for (trigger in listeningTriggers) {
             if (triggerStates.none { it.trigger.triggerId == trigger.triggerId }) {
+                val lastFailure = failedTriggerStates[trigger.triggerId]
+                if (lastFailure != null && now - lastFailure < LOAD_RETRY_INTERVAL_MS) {
+                    continue
+                }
                 val state = createTriggerState(trigger)
                 if (state != null) {
+                    failedTriggerStates.remove(trigger.triggerId)
                     triggerStates.add(state)
                     DebugLogger.d(TAG, "加载工作流 '${trigger.workflowName}' 的 GKD 规则")
+                } else {
+                    failedTriggerStates[trigger.triggerId] = now
+                    DebugLogger.w(TAG, "工作流 '${trigger.workflowName}' 规则加载失败，${LOAD_RETRY_INTERVAL_MS / 1000}s 后重试")
                 }
             }
         }
@@ -181,16 +199,13 @@ class GKDTriggerHandler : ListeningTriggerHandler() {
 
         if (cacheValid) {
             DebugLogger.d(TAG, "使用缓存的订阅: ${file.absolutePath}")
-            return try {
+            try {
                 val content = file.readText()
-                if (content.isNotEmpty()) {
-                    parseSubscriptionContent(content)
-                } else {
-                    emptyList()
-                }
+                val parsed = if (content.isNotEmpty()) parseSubscriptionContent(content) else emptyList()
+                if (parsed.isNotEmpty()) return parsed
+                DebugLogger.w(TAG, "缓存内容无效（无规则），尝试重新下载")
             } catch (e: Exception) {
                 DebugLogger.e(TAG, "读取缓存失败，尝试重新下载", e)
-                downloadSubscription(url, file)
             }
         }
 
@@ -232,12 +247,21 @@ class GKDTriggerHandler : ListeningTriggerHandler() {
                     return@runBlocking emptyList<ResolvedGKDRule>()
                 }
 
-                // 保存到文件
+                // 先解析；只有解析出规则才覆盖缓存，避免把 HTML/错误页写进去
+                val parsed = parseSubscriptionContent(content)
+                if (parsed.isEmpty()) {
+                    DebugLogger.e(TAG, "下载内容无法解析出规则，保留旧缓存: $url")
+                    if (file.exists()) {
+                        val old = file.readText()
+                        if (old.isNotBlank()) {
+                            return@runBlocking parseSubscriptionContent(old)
+                        }
+                    }
+                    return@runBlocking emptyList<ResolvedGKDRule>()
+                }
                 file.writeText(content)
                 DebugLogger.d(TAG, "已保存订阅到: ${file.absolutePath}")
-
-                // 解析
-                parseSubscriptionContent(content)
+                parsed
             } catch (e: Exception) {
                 DebugLogger.e(TAG, "下载订阅失败: ${e.message}", e)
                 // 如果下载失败且有缓存文件，尝试使用缓存
@@ -268,6 +292,13 @@ class GKDTriggerHandler : ListeningTriggerHandler() {
         val trimmed = content.trim()
         if (trimmed.isEmpty() || trimmed.length < 10) {
             DebugLogger.w(TAG, "订阅内容为空或过短")
+            return emptyList()
+        }
+
+        // GitHub 的 issues / 网页链接会返回 HTML（HTTP 200），JSON5 解析必失败；
+        // 提前识别并给出明确提示，避免把 HTML 写进缓存。
+        if (trimmed.startsWith("<")) {
+            DebugLogger.e(TAG, "订阅内容看起来是 HTML 页面（链接可能填错）: ${trimmed.take(80)}")
             return emptyList()
         }
 
@@ -586,27 +617,38 @@ class GKDTriggerHandler : ListeningTriggerHandler() {
             null
         }
 
-        checkAndTriggerWithRoot(context, packageName, className, rootNode, sourceNode)
+        val delayedScheduled = checkAndTriggerWithRoot(context, packageName, className, rootNode, sourceNode)
+        if (!delayedScheduled) {
+            // 没有延迟任务引用节点时才回收，避免 actionDelay 用到已回收的节点
+            try {
+                rootNode.recycle()
+            } catch (_: Exception) {
+            }
+            if (sourceNode != null && sourceNode !== rootNode) {
+                try {
+                    sourceNode.recycle()
+                } catch (_: Exception) {
+                }
+            }
+        }
     }
 
+    /**
+     * @return 是否安排了 actionDelay 延迟任务（延迟任务会继续持有节点，此时不能回收 root/source）。
+     */
     private fun checkAndTriggerWithRoot(
         context: Context,
         packageName: String,
         className: String,
         rootNode: AccessibilityNodeInfo,
         sourceNode: AccessibilityNodeInfo?,
-    ) {
+    ): Boolean {
+        var delayedScheduled = false
         val t = System.currentTimeMillis()
         val currentPackage = packageName
-        // content-changed 的 className 经常是 View 类，不是 Activity；优先用窗口状态事件确认过的 Activity
-        val confirmedActivity = ServiceStateBus.lastActivityClassName
-        val currentActivity = if (ServiceStateBus.lastActivityPackageName == packageName &&
-            !confirmedActivity.isNullOrBlank()
-        ) {
-            confirmedActivity
-        } else {
-            className
-        }
+        // content-changed 的 className 经常是 View 类，不是 Activity；
+        // 优先用该包最近一次窗口状态事件里的类名。
+        val currentActivity = ServiceStateBus.activityClassFor(packageName) ?: className
 
         for (state in triggerStates) {
             try {
@@ -654,6 +696,13 @@ class GKDTriggerHandler : ListeningTriggerHandler() {
                         state.rules.firstOrNull { it.key == key }?.let { state.getRuleState(it).actionCount }
                     }
                     if (!ruleState.shouldTrigger(sharedCooldown, sharedCount)) {
+                        if (rule.appId == null || rule.appId == currentPackage) {
+                            DebugLogger.d(
+                                TAG,
+                                "规则 '${rule.name}' 状态=${ruleState.getStatus(sharedCooldown, sharedCount)} " +
+                                    "(matchTime=${rule.matchTime}, changed=${ruleState.matchChangedTime})"
+                            )
+                        }
                         continue
                     }
 
@@ -670,25 +719,39 @@ class GKDTriggerHandler : ListeningTriggerHandler() {
 
                     // 检查 Activity 匹配
                     if (!matchActivity(rule.activityIds, rule.excludeActivityIds, currentActivity)) {
+                        DebugLogger.d(TAG, "规则 '${rule.name}' Activity 不匹配: current=$currentActivity ids=${rule.activityIds}")
                         continue
                     }
 
+                    DebugLogger.d(
+                        TAG,
+                        "检查规则 '${rule.name}': app=${rule.appId} activity=$currentActivity " +
+                            "matches=${rule.matches.size} any=${rule.anyMatches.size} root=${rule.matchRoot}"
+                    )
+
                     // 获取匹配选项
                     val matchOption = MatchOption(fastQuery = rule.fastQuery ?: false)
-                    // matchRoot=true 从 root 匹配，否则从事件源节点匹配（GKD 语义）
-                    val targetNode = if (rule.matchRoot == true) rootNode else (sourceNode ?: rootNode)
+                    // 优先从 root 匹配（保持原来 VFlow 的行为），root 没命中再回退事件源节点。
+                    // GKD 的语义是 matchRoot=false 从 source 匹配，但 VFlow 的规则/节点树
+                    // 不一定满足这个前提，root 优先更稳。
+                    val fallbackNode = if (rule.matchRoot == true) null else sourceNode
+                    val targetNode = rootNode
 
                     // anyMatches 与 matches 是“与”关系：anyMatches 至少命中一个，matches 必须全部命中
+                    // matchRoot=false 时先从事件源节点查；查不到再回退 root（兼容按整棵树写的规则）
                     var matchedNode: AccessibilityNodeInfo? = null
                     if (rule.anyMatches.isNotEmpty()) {
-                        matchedNode = queryRuleSelectors(targetNode, rule.anyMatches, matchOption, false)
-                            ?: continue
+                        matchedNode = queryRuleSelectorsWithFallback(
+                            targetNode, fallbackNode, rule.anyMatches, matchOption, false
+                        ) ?: continue
                     }
                     if (rule.matches.isNotEmpty()) {
-                        matchedNode = queryRuleSelectors(targetNode, rule.matches, matchOption, true)
-                            ?: continue
+                        matchedNode = queryRuleSelectorsWithFallback(
+                            targetNode, fallbackNode, rule.matches, matchOption, true
+                        ) ?: continue
                     }
                     if (matchedNode == null) {
+                        DebugLogger.d(TAG, "规则 '${rule.name}' 未命中（root/source 都没查到）")
                         continue
                     }
 
@@ -717,6 +780,7 @@ class GKDTriggerHandler : ListeningTriggerHandler() {
                     // 处理触发延迟
                     if (ruleState.actionDelay > 0) {
                         ruleState.startActionDelay(t)
+                        delayedScheduled = true
                         val job = triggerScope.launch {
                             delay(ruleState.actionDelay)
                             performTrigger(context, state, rule, ruleState, matchedNode)
@@ -731,6 +795,7 @@ class GKDTriggerHandler : ListeningTriggerHandler() {
                 DebugLogger.e(TAG, "处理工作流 '${state.trigger.workflowName}' 时出错", e)
             }
         }
+        return delayedScheduled
     }
 
     private fun matchesActivityPattern(pattern: String, activity: String): Boolean {
@@ -790,6 +855,18 @@ class GKDTriggerHandler : ListeningTriggerHandler() {
             }
             null
         }
+    }
+
+    private fun queryRuleSelectorsWithFallback(
+        primary: AccessibilityNodeInfo,
+        fallback: AccessibilityNodeInfo?,
+        selectors: List<Selector>,
+        matchOption: MatchOption,
+        requireAll: Boolean,
+    ): AccessibilityNodeInfo? {
+        val direct = queryRuleSelectors(primary, selectors, matchOption, requireAll)
+        if (direct != null || fallback == null || fallback === primary) return direct
+        return queryRuleSelectors(fallback, selectors, matchOption, requireAll)
     }
 
     /**
