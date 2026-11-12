@@ -17,6 +17,37 @@ data class GKDTriggerState(
     // 已匹配的规则 key 集合（用于 preKeys 检查）
     val matchedKeys: MutableSet<Int> = mutableSetOf()
 
+    // ---- 规则索引（加载时建一次，避免每个窗口事件全量遍历/排序） ----
+    private val rulesByApp: Map<String, List<ResolvedGKDRule>> = rules
+        .filter { it.appId != null }
+        .groupBy { it.appId!! }
+        .mapValues { (_, list) -> list.sortedBy { it.order } }
+
+    private val globalRules: List<ResolvedGKDRule> = rules
+        .filter { it.appId == null }
+        .sortedBy { it.order }
+
+    /** key -> 规则，替代循环里的 firstOrNull（O(n) -> O(1)）。 */
+    val rulesByKey: Map<Int, ResolvedGKDRule> = rules
+        .mapNotNull { rule -> rule.key?.let { it to rule } }
+        .toMap()
+
+    private val candidateCache = java.util.concurrent.ConcurrentHashMap<String, List<ResolvedGKDRule>>()
+
+    /**
+     * 当前前台包名对应的候选规则：该 App 的规则 + 全局规则。
+     * 结果按包名缓存，规则列表不可变，可以直接复用。
+     */
+    fun candidateRules(packageName: String): List<ResolvedGKDRule> =
+        candidateCache.getOrPut(packageName) {
+            val appRules = rulesByApp[packageName].orEmpty()
+            when {
+                globalRules.isEmpty() -> appRules
+                appRules.isEmpty() -> globalRules
+                else -> appRules + globalRules
+            }
+        }
+
     // 当前应用包名和 Activity（用于 resetMatch 检查）
     var currentPackage: String? = null
     var currentActivity: String? = null
