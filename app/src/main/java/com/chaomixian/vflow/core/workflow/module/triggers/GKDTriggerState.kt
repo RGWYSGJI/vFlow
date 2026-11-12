@@ -68,7 +68,8 @@ data class GKDTriggerState(
  */
 data class RuleExecutionState(
     val rule: ResolvedGKDRule,
-    var matchChangedTime: Long = 0L,
+    // 初始就用当前时间：否则带 matchTime 的规则第一帧就会被判 Expired
+    var matchChangedTime: Long = System.currentTimeMillis(),
     var actionTriggerTime: Long = 0L,
     var actionCount: Int = 0,
     var actionDelayTriggerTime: Long = 0L,
