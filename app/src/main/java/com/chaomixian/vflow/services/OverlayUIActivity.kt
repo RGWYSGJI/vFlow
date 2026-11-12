@@ -689,8 +689,6 @@ class OverlayUIActivity : AppCompatActivity() {
         val dialog = MaterialAlertDialogBuilder(this)
             .setTitle(title)
             .setView(editText)
-            // 输入是工作流的必要数据：点外部不关闭，避免误触导致步骤失败。
-            .setCanceledOnTouchOutside(false)
             .setPositiveButton(R.string.common_ok) { _, _ ->
                 val inputText = editText.text.toString()
                 val result: Any? = if (isNumberInputType(type)) inputText.toDoubleOrNull() else inputText
@@ -699,6 +697,9 @@ class OverlayUIActivity : AppCompatActivity() {
             .setNegativeButton(R.string.common_cancel) { _, _ -> cancel() }
             .setOnCancelListener { cancel() }
             .create()
+        // 输入是工作流的必要数据：点外部不关闭，避免误触导致步骤失败。
+        // 注意：setCanceledOnTouchOutside 是 Dialog 的方法，不在 Builder 上。
+        dialog.setCanceledOnTouchOutside(false)
         // 兜底：任何方式被 dismiss 却没走到确定/取消，也要让等待方返回，绝不让任务悬挂。
         dialog.setOnDismissListener { completePending(null) }
         dialog.show()
