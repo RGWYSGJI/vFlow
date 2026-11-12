@@ -55,6 +55,7 @@ import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
 import java.io.File
 import java.util.*
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 
@@ -64,6 +65,9 @@ class OverlayUIActivity : AppCompatActivity() {
     private var speechAutoStartPending = false
     private var speechDialog: AlertDialog? = null
     private var speechRecognizer: SpeechRecognizer? = null
+
+    /** 本次界面请求对应的等待方；onDestroy 时若仍未完成，必须让它返回，否则工作流会永久挂起。 */
+    private var pendingResult: CompletableDeferred<Any?>? = null
     private var speechTitleView: TextView? = null
     private var speechStatusView: TextView? = null
     private var speechResultEditText: TextInputEditText? = null
@@ -119,6 +123,7 @@ class OverlayUIActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        pendingResult = ExecutionUIService.inputCompletable
         applyDynamicTheme()
         configureWindowForLockScreen()
         handleIntent()
@@ -128,6 +133,8 @@ class OverlayUIActivity : AppCompatActivity() {
         val allowShowOnLockScreen = OverlayUiPreferences.isShowOnLockScreenAllowed(this)
         setShowWhenLocked(allowShowOnLockScreen)
         setTurnScreenOn(allowShowOnLockScreen)
+        // 透明 Activity 默认"点外部即 finish"：那样弹窗消失但等待方拿不到任何结果，工作流会永远卡住。
+        setFinishOnTouchOutside(false)
         if (OverlayUiPreferences.isPopupKeepScreenOnAllowed(this)) {
             window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         }
@@ -156,14 +163,6 @@ class OverlayUIActivity : AppCompatActivity() {
                     isTimeInputType(inputType) -> showTimePickerDialog(title ?: getString(R.string.overlay_ui_input_time_title))
                     isDateInputType(inputType) -> showDatePickerDialog(title ?: getString(R.string.overlay_ui_input_date_title))
                     else -> showTextInputDialog(title ?: getString(R.string.overlay_ui_input_text_title), inputType)
-                }
-            }
-            "menu_choice" -> {
-                val choices = intent.getStringArrayListExtra("menu_choices")
-                if (choices.isNullOrEmpty()) {
-                    finishWithError()
-                } else {
-                    showMenuChoiceDialog(title ?: getString(R.string.overlay_ui_menu_choice_title), choices)
                 }
             }
             SpeechToTextOverlayContract.REQUEST_TYPE -> handleSpeechToTextRequest(title)
@@ -651,14 +650,6 @@ class OverlayUIActivity : AppCompatActivity() {
         )
     }
 
-    private fun showMenuChoiceDialog(title: String, choices: List<String>) {
-        MaterialAlertDialogBuilder(this)
-            .setTitle(title)
-            .setItems(choices.toTypedArray()) { _, index -> complete(index) }
-            .setOnCancelListener { cancel() }
-            .show()
-    }
-
     /**
      * 为文本快速查看对话框添加复制和分享按钮，并重写行为
      * 使用自定义布局以支持长按选择文本
@@ -695,9 +686,11 @@ class OverlayUIActivity : AppCompatActivity() {
                 InputType.TYPE_CLASS_TEXT
             }
         }
-        MaterialAlertDialogBuilder(this)
+        val dialog = MaterialAlertDialogBuilder(this)
             .setTitle(title)
             .setView(editText)
+            // 输入是工作流的必要数据：点外部不关闭，避免误触导致步骤失败。
+            .setCanceledOnTouchOutside(false)
             .setPositiveButton(R.string.common_ok) { _, _ ->
                 val inputText = editText.text.toString()
                 val result: Any? = if (isNumberInputType(type)) inputText.toDoubleOrNull() else inputText
@@ -705,7 +698,10 @@ class OverlayUIActivity : AppCompatActivity() {
             }
             .setNegativeButton(R.string.common_cancel) { _, _ -> cancel() }
             .setOnCancelListener { cancel() }
-            .show()
+            .create()
+        // 兜底：任何方式被 dismiss 却没走到确定/取消，也要让等待方返回，绝不让任务悬挂。
+        dialog.setOnDismissListener { completePending(null) }
+        dialog.show()
     }
 
     private fun isNumberInputType(type: String?): Boolean {
@@ -770,20 +766,30 @@ class OverlayUIActivity : AppCompatActivity() {
 
     private fun complete(result: Any?) {
         dismissSpeechDialog()
-        ExecutionUIService.inputCompletable?.complete(result)
+        completePending(result)
         finish()
     }
 
     private fun cancel() {
         dismissSpeechDialog()
-        ExecutionUIService.inputCompletable?.complete(null)
+        completePending(null)
         finish()
     }
 
     private fun finishWithError() {
         dismissSpeechDialog()
-        ExecutionUIService.inputCompletable?.complete(null)
+        completePending(null)
         finish()
+    }
+
+    /**
+     * 完成本次请求对应的等待方。只认 onCreate 时捕获的那个 deferred，
+     * 避免复用全局静态字段时误完成另一个请求。
+     */
+    private fun completePending(result: Any?) {
+        val target = pendingResult
+        pendingResult = null
+        target?.complete(result)
     }
 
     private fun finishWithSpeechError(message: String) {
@@ -797,6 +803,13 @@ class OverlayUIActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        // 界面被系统回收/结束（含切换 App 后 noHistory 触发的 finish）时，
+        // 让仍在等待的工作流立即按"用户取消"返回；否则 await() 永不返回，连"失败跳过"策略都无法生效。
+        val target = pendingResult
+        pendingResult = null
+        if (target != null && target.isActive) {
+            target.complete(null)
+        }
         dismissSpeechDialog()
         speechRecognizer?.destroy()
         speechRecognizer = null
