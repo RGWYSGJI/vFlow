@@ -1,6 +1,7 @@
 package com.chaomixian.vflow.core.workflow.module.triggers.handlers
 
 import android.content.Context
+import android.graphics.Rect
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import com.chaomixian.vflow.core.logging.DebugLogger
@@ -609,13 +610,14 @@ class GKDTriggerHandler : ListeningTriggerHandler() {
         syncTriggerStates()
 
         val service = ServiceStateBus.getAccessibilityService() ?: return
-        val rootNode = service.rootInActiveWindow ?: return
-        // GKD 的 matchRoot=false 是“从事件源节点开始匹配”；拿不到 source 时退回 root。
+        // GKD 的 matchRoot=false 是“从事件源节点开始匹配”；
+        // rootInActiveWindow 为空（如通知栏、输入法窗口）时用 source 兜底，避免直接放弃。
         val sourceNode = try {
             event?.source
         } catch (_: Exception) {
             null
         }
+        val rootNode = service.rootInActiveWindow ?: sourceNode ?: return
 
         val delayedScheduled = checkAndTriggerWithRoot(context, packageName, className, rootNode, sourceNode)
         if (!delayedScheduled) {
@@ -1120,6 +1122,33 @@ class GKDTriggerHandler : ListeningTriggerHandler() {
             "longClickable" -> node.isLongClickable
             "visibleToUser" -> node.isVisibleToUser
             "scrollable" -> node.isScrollable
+
+            // GKD 支持、VFlow 之前缺失的几何/层级属性（订阅里有 left/top/width/height）
+            // 节点可能已失效，取不到就返回 null，让这条规则不命中，而不是抛异常。
+            "left", "top", "right", "bottom", "width", "height" -> try {
+                val rect = Rect()
+                node.getBoundsInScreen(rect)
+                when (name) {
+                    "left" -> rect.left
+                    "top" -> rect.top
+                    "right" -> rect.right
+                    "bottom" -> rect.bottom
+                    "width" -> rect.width()
+                    else -> rect.height()
+                }
+            } catch (_: Exception) {
+                null
+            }
+            "depth" -> try {
+                calculateDepth(node)
+            } catch (_: Exception) {
+                null
+            }
+            "parent" -> try {
+                node.parent
+            } catch (_: Exception) {
+                null
+            }
             "selected" -> node.isSelected
             "focused" -> node.isFocused
 
