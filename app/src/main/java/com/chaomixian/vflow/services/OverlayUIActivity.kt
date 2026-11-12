@@ -165,6 +165,13 @@ class OverlayUIActivity : AppCompatActivity() {
                     else -> showTextInputDialog(title ?: getString(R.string.overlay_ui_input_text_title), inputType)
                 }
             }
+            "menu_choice" -> {
+                val items = intent.getStringArrayListExtra("menu_items").orEmpty()
+                showMenuChoiceDialog(
+                    title ?: getString(R.string.overlay_ui_menu_choice_title),
+                    items
+                )
+            }
             SpeechToTextOverlayContract.REQUEST_TYPE -> handleSpeechToTextRequest(title)
             "pick_image" -> {
                 pickImageLauncher.launch(
@@ -638,6 +645,22 @@ class OverlayUIActivity : AppCompatActivity() {
                 Toast.LENGTH_LONG
             ).show()
         }
+    }
+
+    private fun showMenuChoiceDialog(title: String, items: List<String>) {
+        if (items.isEmpty()) {
+            finishWithError()
+            return
+        }
+        val dialog = SearchableWorkflowDialog.show(
+            context = this,
+            title = title,
+            items = items.mapIndexed { index, text -> WorkflowDialogItem(index.toString(), text) },
+            onSelected = { item -> complete(item.id.toIntOrNull() ?: -1) },
+            onCancelled = { cancel() }
+        )
+        // 兜底：任何方式被 dismiss 却没选中，也要让等待方返回，避免任务悬挂。
+        dialog.setOnDismissListener { completePending(null) }
     }
 
     private fun showWorkflowChooserDialog(workflows: Map<String, String>) {
