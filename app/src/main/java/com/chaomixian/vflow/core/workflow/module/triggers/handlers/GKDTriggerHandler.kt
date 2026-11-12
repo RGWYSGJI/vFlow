@@ -1,6 +1,7 @@
 package com.chaomixian.vflow.core.workflow.module.triggers.handlers
 
 import android.content.Context
+import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import com.chaomixian.vflow.core.logging.DebugLogger
 import com.chaomixian.vflow.core.types.complex.VScreenElement
@@ -66,16 +67,20 @@ class GKDTriggerHandler : ListeningTriggerHandler() {
         syncTriggerStates()
 
         listeningJob = triggerScope.launch {
-            launch {
-                ServiceStateBus.windowChangeEventFlow.collect { (packageName, className) ->
-                    DebugLogger.d(TAG, "收到窗口变化事件: $packageName / $className")
-                    checkAndTriggerWorkflows(context, packageName, className)
-                }
-            }
-            launch {
-                ServiceStateBus.windowContentChangedFlow.collect { (packageName, className) ->
-                    DebugLogger.d(TAG, "收到窗口内容变化事件: $packageName / $className")
-                    checkAndTriggerWorkflows(context, packageName, className)
+            // 只保留最新一条事件（ServiceStateBus 内部 conflate），串行匹配，
+            // 避免 content-changed 高频事件把匹配队列撑爆。
+            ServiceStateBus.gkdEventSignal.collect {
+                val windowEvent = ServiceStateBus.takeGkdWindowEvent() ?: return@collect
+                try {
+                    DebugLogger.d(TAG, "收到窗口事件: ${windowEvent.packageName} / ${windowEvent.className}")
+                    checkAndTriggerWorkflows(
+                        context = context,
+                        packageName = windowEvent.packageName,
+                        className = windowEvent.className,
+                        event = windowEvent.event,
+                    )
+                } finally {
+                    windowEvent.event?.recycle()
                 }
             }
         }
@@ -138,7 +143,28 @@ class GKDTriggerHandler : ListeningTriggerHandler() {
             return null
         }
 
-        return GKDTriggerState(trigger = trigger, rules = rules)
+        // 触发器面板上的 5 个时间参数是“规则未声明时的默认值”，
+        // 规则自己的字段优先（对齐 GKD 的 rule -> group -> 默认值 合并顺序）。
+        fun longParam(key: String): Long? = (config[key] as? Number)?.toLong()
+        fun intParam(key: String): Int? = (config[key] as? Number)?.toInt()
+
+        val defaultActionCd = longParam("actionCd")
+        val defaultActionDelay = longParam("actionDelay")
+        val defaultMatchTime = longParam("matchTime")
+        val defaultMatchDelay = longParam("matchDelay")
+        val defaultActionMaximum = intParam("actionMaximum")
+
+        val rulesWithDefaults = rules.map { rule ->
+            rule.copy(
+                actionCd = rule.actionCd ?: defaultActionCd,
+                actionDelay = rule.actionDelay ?: defaultActionDelay,
+                matchTime = rule.matchTime ?: defaultMatchTime,
+                matchDelay = rule.matchDelay ?: defaultMatchDelay,
+                actionMaximum = rule.actionMaximum ?: defaultActionMaximum,
+            )
+        }
+
+        return GKDTriggerState(trigger = trigger, rules = rulesWithDefaults)
     }
 
     /**
@@ -327,7 +353,7 @@ class GKDTriggerHandler : ListeningTriggerHandler() {
                                     return@forEachIndexed
                                 }
 
-                                val rule = parseRule(ruleObj, groupName, appId)
+                                val rule = parseRule(ruleObj, groupObj, groupName, appId)
                                 if (rule != null) {
                                     rules.add(rule)
                                 }
@@ -376,7 +402,7 @@ class GKDTriggerHandler : ListeningTriggerHandler() {
                             return@forEachIndexed
                         }
 
-                        val rule = parseRule(ruleObj, groupName, null)
+                        val rule = parseRule(ruleObj, groupObj, groupName, null)
                         if (rule != null) {
                             rules.add(rule)
                         }
@@ -394,9 +420,13 @@ class GKDTriggerHandler : ListeningTriggerHandler() {
      */
     private fun parseRule(
         ruleObj: JsonObject,
+        groupObj: JsonObject?,
         groupName: String,
         appId: String?
     ): ResolvedGKDRule? {
+        // 规则字段优先，缺省回退到 group 级默认值（对齐 GKD 的 RuleExecutionParameters.resolve）
+        fun field(name: String): JsonElement? = ruleObj[name] ?: groupObj?.get(name)
+
         val ruleName = ruleObj["name"]?.jsonPrimitive?.content ?: "未命名规则"
         val ruleKey = ruleObj["key"]?.jsonPrimitive?.int
 
@@ -411,7 +441,7 @@ class GKDTriggerHandler : ListeningTriggerHandler() {
         }
 
         // 解析 resetMatch
-        val resetMatch = ruleObj["resetMatch"]?.jsonPrimitive?.content
+        val resetMatch = field("resetMatch")?.jsonPrimitive?.content
 
         // 解析选择器
         val matches = parseSelectors(ruleObj["matches"])
@@ -437,19 +467,20 @@ class GKDTriggerHandler : ListeningTriggerHandler() {
             key = ruleKey,
             preKeys = preKeys,
             resetMatch = resetMatch,
-            actionCd = ruleObj["actionCd"]?.jsonPrimitive?.long,
-            actionDelay = ruleObj["actionDelay"]?.jsonPrimitive?.long,
-            matchDelay = ruleObj["matchDelay"]?.jsonPrimitive?.long,
-            matchTime = ruleObj["matchTime"]?.jsonPrimitive?.long,
-            matchRoot = ruleObj["matchRoot"]?.jsonPrimitive?.boolean,
-            fastQuery = ruleObj["fastQuery"]?.jsonPrimitive?.boolean,
-            actionMaximum = ruleObj["actionMaximum"]?.jsonPrimitive?.int,
+            actionCd = field("actionCd")?.jsonPrimitive?.long,
+            actionDelay = field("actionDelay")?.jsonPrimitive?.long,
+            matchDelay = field("matchDelay")?.jsonPrimitive?.long,
+            matchTime = field("matchTime")?.jsonPrimitive?.long,
+            matchRoot = field("matchRoot")?.jsonPrimitive?.boolean,
+            fastQuery = field("fastQuery")?.jsonPrimitive?.boolean,
+            actionMaximum = field("actionMaximum")?.jsonPrimitive?.int,
             // 新增字段
-            actionCdKey = ruleObj["actionCdKey"]?.jsonPrimitive?.int,
-            actionMaximumKey = ruleObj["actionMaximumKey"]?.jsonPrimitive?.int,
-            forcedTime = ruleObj["forcedTime"]?.jsonPrimitive?.long,
-            priorityTime = ruleObj["priorityTime"]?.jsonPrimitive?.long,
-            priorityActionMaximum = ruleObj["priorityActionMaximum"]?.jsonPrimitive?.int
+            actionCdKey = field("actionCdKey")?.jsonPrimitive?.int,
+            actionMaximumKey = field("actionMaximumKey")?.jsonPrimitive?.int,
+            forcedTime = field("forcedTime")?.jsonPrimitive?.long,
+            priorityTime = field("priorityTime")?.jsonPrimitive?.long,
+            priorityActionMaximum = field("priorityActionMaximum")?.jsonPrimitive?.int,
+            order = field("order")?.jsonPrimitive?.int ?: 0
         )
     }
 
@@ -538,15 +569,44 @@ class GKDTriggerHandler : ListeningTriggerHandler() {
     /**
      * 检查并触发匹配的工作流
      */
-    private fun checkAndTriggerWorkflows(context: Context, packageName: String, className: String) {
+    private fun checkAndTriggerWorkflows(
+        context: Context,
+        packageName: String,
+        className: String,
+        event: AccessibilityEvent? = null,
+    ) {
         syncTriggerStates()
 
         val service = ServiceStateBus.getAccessibilityService() ?: return
         val rootNode = service.rootInActiveWindow ?: return
+        // GKD 的 matchRoot=false 是“从事件源节点开始匹配”；拿不到 source 时退回 root。
+        val sourceNode = try {
+            event?.source
+        } catch (_: Exception) {
+            null
+        }
 
+        checkAndTriggerWithRoot(context, packageName, className, rootNode, sourceNode)
+    }
+
+    private fun checkAndTriggerWithRoot(
+        context: Context,
+        packageName: String,
+        className: String,
+        rootNode: AccessibilityNodeInfo,
+        sourceNode: AccessibilityNodeInfo?,
+    ) {
         val t = System.currentTimeMillis()
         val currentPackage = packageName
-        val currentActivity = className
+        // content-changed 的 className 经常是 View 类，不是 Activity；优先用窗口状态事件确认过的 Activity
+        val confirmedActivity = ServiceStateBus.lastActivityClassName
+        val currentActivity = if (ServiceStateBus.lastActivityPackageName == packageName &&
+            !confirmedActivity.isNullOrBlank()
+        ) {
+            confirmedActivity
+        } else {
+            className
+        }
 
         for (state in triggerStates) {
             try {
@@ -577,22 +637,30 @@ class GKDTriggerHandler : ListeningTriggerHandler() {
                     state.currentActivity = currentActivity
                 }
 
-                // 匹配规则
-                for (rule in state.rules) {
+                // 匹配规则：priority 规则优先，其余按 order 排序（对齐 GKD）
+                // 先算好 priority 再排序，避免比较器里读时钟导致排序契约不一致
+                val orderedRules = state.rules
+                    .map { rule -> rule to if (state.getRuleState(rule).isPriority()) 0 else 1 }
+                    .sortedWith(compareBy<Pair<ResolvedGKDRule, Int>>({ it.second }, { it.first.order }))
+                    .map { it.first }
+                for (rule in orderedRules) {
                     val ruleState = state.getRuleState(rule)
 
-                    // 检查规则状态
-                    if (!ruleState.shouldTrigger()) {
+                    // 检查规则状态（actionCdKey / actionMaximumKey 共享）
+                    val sharedCooldown = rule.actionCdKey?.let { key ->
+                        state.rules.firstOrNull { it.key == key }?.let { state.getRuleState(it).actionTriggerTime }
+                    }
+                    val sharedCount = rule.actionMaximumKey?.let { key ->
+                        state.rules.firstOrNull { it.key == key }?.let { state.getRuleState(it).actionCount }
+                    }
+                    if (!ruleState.shouldTrigger(sharedCooldown, sharedCount)) {
                         continue
                     }
 
-                    // 检查前置规则 (preRules) - 必须是最后触发的规则
-                    if (rule.preKeys.isNotEmpty()) {
-                        val lastTrigger = state.lastTriggerRule
-                        if (lastTrigger == null || lastTrigger.key !in rule.preKeys) {
-                            DebugLogger.d(TAG, "规则 '${rule.name}' 的前置规则未触发 (preKeys=${rule.preKeys}, lastTriggerKey=${lastTrigger?.key})")
-                            continue
-                        }
+                    // 检查前置规则 (preRules) - 用已匹配 key 集合，和 GKD 的 preRules 语义一致
+                    if (!rule.checkPreKeys(state.matchedKeys)) {
+                        DebugLogger.d(TAG, "规则 '${rule.name}' 的前置规则未触发 (preKeys=${rule.preKeys}, matchedKeys=${state.matchedKeys})")
+                        continue
                     }
 
                     // 检查应用匹配
@@ -607,22 +675,30 @@ class GKDTriggerHandler : ListeningTriggerHandler() {
 
                     // 获取匹配选项
                     val matchOption = MatchOption(fastQuery = rule.fastQuery ?: false)
+                    // matchRoot=true 从 root 匹配，否则从事件源节点匹配（GKD 语义）
+                    val targetNode = if (rule.matchRoot == true) rootNode else (sourceNode ?: rootNode)
 
-                    // 查询匹配的节点 - 先尝试 anyMatches
-                    var matchedNode = queryRuleSelectors(rootNode, rule.anyMatches, matchOption, false)
-                        ?: queryRuleSelectors(rootNode, rule.matches, matchOption, true)
-
+                    // anyMatches 与 matches 是“与”关系：anyMatches 至少命中一个，matches 必须全部命中
+                    var matchedNode: AccessibilityNodeInfo? = null
+                    if (rule.anyMatches.isNotEmpty()) {
+                        matchedNode = queryRuleSelectors(targetNode, rule.anyMatches, matchOption, false)
+                            ?: continue
+                    }
+                    if (rule.matches.isNotEmpty()) {
+                        matchedNode = queryRuleSelectors(targetNode, rule.matches, matchOption, true)
+                            ?: continue
+                    }
                     if (matchedNode == null) {
                         continue
                     }
 
                     // 检查排除条件
-                    if (queryRuleSelectors(rootNode, rule.excludeMatches, matchOption, false) != null) {
+                    if (queryRuleSelectors(targetNode, rule.excludeMatches, matchOption, false) != null) {
                         continue
                     }
                     if (rule.excludeAllMatches.isNotEmpty()) {
                         val allExcluded = rule.excludeAllMatches.all { selector ->
-                            queryRuleSelectors(rootNode, listOf(selector), matchOption, false) == null
+                            queryRuleSelectors(targetNode, listOf(selector), matchOption, false) == null
                         }
                         if (!allExcluded) {
                             continue
@@ -657,6 +733,11 @@ class GKDTriggerHandler : ListeningTriggerHandler() {
         }
     }
 
+    private fun matchesActivityPattern(pattern: String, activity: String): Boolean {
+        if (pattern == "*") return true
+        return activity.startsWith(pattern)
+    }
+
     /**
      * 匹配 Activity
      */
@@ -667,9 +748,7 @@ class GKDTriggerHandler : ListeningTriggerHandler() {
     ): Boolean {
         // 检查排除
         if (excludeActivityIds != null) {
-            if (excludeActivityIds.any { pattern ->
-                    pattern == currentActivity || pattern == "*" || currentActivity.contains(pattern)
-                }) {
+            if (excludeActivityIds.any { pattern -> matchesActivityPattern(pattern, currentActivity) }) {
                 return false
             }
         }
@@ -677,10 +756,8 @@ class GKDTriggerHandler : ListeningTriggerHandler() {
         // 如果没有指定 activityIds，则匹配所有
         if (activityIds == null) return true
 
-        // 检查是否匹配
-        return activityIds.any { pattern ->
-            pattern == currentActivity || pattern == "*" || currentActivity.contains(pattern)
-        }
+        // 检查是否匹配（GKD 用前缀匹配，不是子串包含）
+        return activityIds.any { pattern -> matchesActivityPattern(pattern, currentActivity) }
     }
 
     /**
@@ -692,7 +769,7 @@ class GKDTriggerHandler : ListeningTriggerHandler() {
      * @return 匹配的节点或 null
      */
     private fun queryRuleSelectors(
-        rootNode: AccessibilityNodeInfo,
+        targetNode: AccessibilityNodeInfo,
         selectors: List<Selector>,
         matchOption: MatchOption,
         requireAll: Boolean
@@ -703,19 +780,44 @@ class GKDTriggerHandler : ListeningTriggerHandler() {
             // 全部必须匹配
             var resultNode: AccessibilityNodeInfo? = null
             for (selector in selectors) {
-                resultNode = transform.querySelectorAll(rootNode, selector, matchOption).firstOrNull()
-                    ?: return null
+                resultNode = querySingleSelector(targetNode, selector, matchOption) ?: return null
             }
             resultNode
         } else {
             // 任一匹配即可
             for (selector in selectors) {
-                transform.querySelectorAll(rootNode, selector, matchOption).firstOrNull()?.let {
-                    return it
-                }
+                querySingleSelector(targetNode, selector, matchOption)?.let { return it }
             }
             null
         }
+    }
+
+    /**
+     * 单个选择器匹配：先匹配目标节点自身，再查后代；selector.isMatchRoot 时只匹配自身。
+     * 同时回收“查询出来但用不到”的候选节点，避免节点池耗尽。
+     */
+    private fun querySingleSelector(
+        targetNode: AccessibilityNodeInfo,
+        selector: Selector,
+        matchOption: MatchOption,
+    ): AccessibilityNodeInfo? {
+        val selfMatch = selector.match(targetNode, transform, matchOption)
+        if (selfMatch != null) return selfMatch
+        if (selector.isMatchRoot) return null
+
+        val iterator = transform.querySelectorAll(targetNode, selector, matchOption).iterator()
+        if (!iterator.hasNext()) return null
+        val first = iterator.next()
+        while (iterator.hasNext()) {
+            val extra = iterator.next()
+            if (extra !== first && extra !== targetNode) {
+                try {
+                    extra.recycle()
+                } catch (_: Exception) {
+                }
+            }
+        }
+        return first
     }
 
     /**
