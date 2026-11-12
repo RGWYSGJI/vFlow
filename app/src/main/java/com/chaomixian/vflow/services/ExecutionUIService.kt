@@ -20,6 +20,7 @@ import com.chaomixian.vflow.core.workflow.model.Workflow
 import com.chaomixian.vflow.ui.common.OverlayUIActivity
 import com.google.gson.Gson
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.Serializable
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -39,6 +40,10 @@ class ExecutionUIService(private val context: Context) {
         private const val INTERACTIVE_CHANNEL_ID = "vflow_interactive_notifications"
         private const val INTERACTIVE_CHANNEL_NAME = "交互式请求"
         private const val QUICK_VIEW_TEXT_LIMIT = 50_000
+        /**
+         * 交互请求的最长等待时间。超时按"取消"处理，避免界面被回收后工作流永久挂起。
+         */
+        private const val INTERACTIVE_TIMEOUT_MS = 5 * 60 * 1000L
         private val notificationIdCounter = AtomicInteger(1000)
 
         internal fun limitQuickViewContentForIntent(
@@ -74,8 +79,18 @@ class ExecutionUIService(private val context: Context) {
     /**
      * 使用三层回退逻辑来启动UI并等待结果。
      */
-    private suspend fun startActivityAndAwaitResult(intent: Intent, title: String, content: String): CompletableDeferred<Any?> {
+    private suspend fun startActivityAndAwaitResult(intent: Intent, title: String, content: String): Any? {
+        val deferred = launchInteractiveUi(intent, title, content)
+        return withTimeoutOrNull(INTERACTIVE_TIMEOUT_MS) { deferred.await() }
+    }
+
+    /**
+     * 启动交互界面，返回本次请求对应的 deferred；由调用方负责等待（带超时）。
+     */
+    private suspend fun launchInteractiveUi(intent: Intent, title: String, content: String): CompletableDeferred<Any?> {
         val deferred = CompletableDeferred<Any?>()
+        // 上一个请求若还没被消费（例如界面被系统回收），先让它返回，避免两个请求互相覆盖导致悬挂。
+        inputCompletable?.takeIf { it.isActive }?.complete(null)
         inputCompletable = deferred
 
         // --- 尝试 1: 直接启动 (最适合前台场景) ---
@@ -192,17 +207,7 @@ class ExecutionUIService(private val context: Context) {
             putExtra("input_type", type)
             putExtra("title", title)
         }
-        return startActivityAndAwaitResult(intent, title, "点击这里输入 $type").await()
-    }
-
-    suspend fun requestMenuChoice(title: String, choices: List<String>): Int? {
-        if (choices.isEmpty()) return null
-        val intent = Intent(context, OverlayUIActivity::class.java).apply {
-            putExtra("request_type", "menu_choice")
-            putExtra("title", title)
-            putStringArrayListExtra("menu_choices", ArrayList(choices))
-        }
-        return startActivityAndAwaitResult(intent, title, choices.joinToString(" / ").take(50)).await() as? Int
+        return startActivityAndAwaitResult(intent, title, "点击这里输入 $type")
     }
 
     suspend fun requestSpeechToText(
@@ -221,7 +226,7 @@ class ExecutionUIService(private val context: Context) {
             intent,
             request.title,
             context.getString(R.string.overlay_ui_speech_notification_content)
-        ).await() as? SpeechToTextResult
+        ) as? SpeechToTextResult
     }
 
     /**
@@ -238,7 +243,7 @@ class ExecutionUIService(private val context: Context) {
             putExtra("title", title)
             putExtra("content", limitedContent)
         }
-        startActivityAndAwaitResult(intent, title, limitedContent.take(50)).await()
+        startActivityAndAwaitResult(intent, title, limitedContent.take(50))
     }
 
     /**
@@ -252,7 +257,7 @@ class ExecutionUIService(private val context: Context) {
             putExtra("title", title)
             putExtra("content", imageUri)
         }
-        startActivityAndAwaitResult(intent, title, "点击查看图片").await()
+        startActivityAndAwaitResult(intent, title, "点击查看图片")
     }
 
 
@@ -264,7 +269,7 @@ class ExecutionUIService(private val context: Context) {
         val intent = Intent(context, OverlayUIActivity::class.java).apply {
             putExtra("request_type", "pick_image")
         }
-        return startActivityAndAwaitResult(intent, "选择图片", "请点击以从相册中选择一张图片").await() as? String
+        return startActivityAndAwaitResult(intent, "选择图片", "请点击以从相册中选择一张图片") as? String
     }
 
     /**
@@ -278,7 +283,7 @@ class ExecutionUIService(private val context: Context) {
             putExtra("request_type", "workflow_chooser")
             putExtra("workflow_list", workflowInfo as Serializable)
         }
-        return startActivityAndAwaitResult(intent, "选择工作流", "有多个工作流可处理此操作，请选择一个").await() as? String
+        return startActivityAndAwaitResult(intent, "选择工作流", "有多个工作流可处理此操作，请选择一个") as? String
     }
 
     /**
@@ -305,7 +310,7 @@ class ExecutionUIService(private val context: Context) {
                 else -> return false
             }
         }
-        return startActivityAndAwaitResult(intent, "分享", "点击以打开系统分享菜单").await() as? Boolean
+        return startActivityAndAwaitResult(intent, "分享", "点击以打开系统分享菜单") as? Boolean
     }
 
     /**
@@ -316,7 +321,7 @@ class ExecutionUIService(private val context: Context) {
         val intent = Intent(context, OverlayUIActivity::class.java).apply {
             putExtra("request_type", "media_projection")
         }
-        return startActivityAndAwaitResult(intent, "需要截图权限", "请点击以授予vFlow屏幕截图权限").await() as? Intent
+        return startActivityAndAwaitResult(intent, "需要截图权限", "请点击以授予vFlow屏幕截图权限") as? Intent
     }
 
     /**
@@ -341,6 +346,6 @@ class ExecutionUIService(private val context: Context) {
                 moduleName,
                 errorMessage
             )
-        ).await()
+        )
     }
 }
