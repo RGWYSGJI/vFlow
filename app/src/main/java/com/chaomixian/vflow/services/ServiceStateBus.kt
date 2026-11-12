@@ -159,8 +159,9 @@ object ServiceStateBus {
         if (!confirmedActivityClassName.isNullOrBlank()) {
             lastActivityClassName = confirmedActivityClassName
             lastActivityPackageName = packageName
+            // 只记录 PackageManager 确认过的 Activity，避免 Dialog/View 类名污染
+            rememberActivityClass(packageName, confirmedActivityClassName)
         }
-        rememberActivityClass(packageName, confirmedActivityClassName ?: className)
         _windowChangeEventFlow.emit(packageName to className)
     }
 
