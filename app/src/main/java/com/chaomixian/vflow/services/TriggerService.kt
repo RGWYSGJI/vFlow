@@ -25,6 +25,8 @@ import com.chaomixian.vflow.core.workflow.model.TriggerSpec
 import com.chaomixian.vflow.core.workflow.model.Workflow
 import com.chaomixian.vflow.core.workflow.module.scripted.ModuleManager
 import com.chaomixian.vflow.core.workflow.module.triggers.KeyEventTriggerModule
+import com.chaomixian.vflow.core.workflow.module.triggers.SmsTriggerModule
+import com.chaomixian.vflow.core.workflow.module.triggers.handlers.SmsTriggerHandler
 import com.chaomixian.vflow.core.workflow.module.triggers.handlers.ITriggerHandler
 import com.chaomixian.vflow.core.workflow.module.triggers.handlers.KeyEventTriggerHandler
 import com.chaomixian.vflow.core.workflow.module.triggers.handlers.TriggerHandlerRegistry
@@ -64,6 +66,10 @@ class TriggerService : Service() {
         const val EXTRA_TRIGGER_DELTA = "extra_trigger_delta"
         // 新增的通知更新 Action
         const val ACTION_UPDATE_NOTIFICATION = "com.chaomixian.vflow.ACTION_UPDATE_NOTIFICATION"
+        // 清单 SmsReceiver 冷启动拉起服务时，用它把短信带进来
+        const val ACTION_SMS_RECEIVED = "com.chaomixian.vflow.ACTION_SMS_RECEIVED"
+        const val EXTRA_SMS_SENDER = "extra_sms_sender"
+        const val EXTRA_SMS_CONTENT = "extra_sms_content"
     }
 
     override fun attachBaseContext(newBase: Context) {
@@ -176,6 +182,12 @@ class TriggerService : Service() {
                 if (delta != null) {
                     handleWorkflowRemoved(delta.oldTriggerRefs)
                 }
+            }
+            // 短信（清单 receiver 冷启动拉起服务）
+            ACTION_SMS_RECEIVED -> {
+                val sender = intent.getStringExtra(EXTRA_SMS_SENDER).orEmpty()
+                val content = intent.getStringExtra(EXTRA_SMS_CONTENT).orEmpty()
+                (triggerHandlers[SmsTriggerModule().id] as? SmsTriggerHandler)?.handleSms(this, sender, content)
             }
             // 按键事件直接分发
             KeyEventTriggerHandler.ACTION_KEY_EVENT_RECEIVED -> {
