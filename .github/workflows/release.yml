@@ -88,6 +88,7 @@ jobs:
 
       - name: Rotate-sign APKs for legacy debug users
         id: rotate_apks
+        if: false
         shell: bash
         env:
           RELEASE_KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
