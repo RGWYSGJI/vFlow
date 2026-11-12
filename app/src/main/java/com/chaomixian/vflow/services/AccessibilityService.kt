@@ -73,6 +73,13 @@ open class AccessibilityService : AccessibilityService() {
 
         if (packageName == null || className == null) return
 
+        // GKD 触发器需要事件副本（含 source 节点）做“从事件源匹配”，单独走最新事件通道。
+        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
+            event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
+        ) {
+            ServiceStateBus.postGkdWindowEvent(packageName, className, event)
+        }
+
         // TYPE_WINDOW_STATE_CHANGED: 窗口状态变化（Activity切换、Dialog显示等）
         if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
             val confirmedActivityClassName = resolveConfirmedActivityClassName(packageName, className)
