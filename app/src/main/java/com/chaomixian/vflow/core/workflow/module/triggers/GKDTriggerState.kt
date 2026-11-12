@@ -165,9 +165,9 @@ data class RuleExecutionState(
      * 是否是 priority 规则（priorityTime 窗口内、且未超过 priorityActionMaximum）。
      */
     fun isPriority(): Boolean {
-        val priorityTimeVal = priorityTime ?: return false
+        val priorityTimeVal = rule.priorityTime ?: return false
         if (priorityTimeVal <= 0) return false
-        val maxActions = priorityActionMaximum
+        val maxActions = rule.priorityActionMaximum
         if (maxActions != null && actionCount >= maxActions) return false
         return System.currentTimeMillis() - matchChangedTime < priorityTimeVal + matchDelay
     }
